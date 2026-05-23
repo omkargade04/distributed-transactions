@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: payment-postgres
+    environment:
+      POSTGRES_USER: payment
+      POSTGRES_PASSWORD: payment_dev
+      POSTGRES_DB: payment
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  payment-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payment-api
+    environment:
+      DB_URL: "postgres://payment:payment_dev@postgres:5432/payment?sslmode=disable"
+      PORT: "8080"
+      LOG_LEVEL: "info"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"   # DELIBERATE: crashes must stay crashed in v1
+
+volumes:
+  pgdata:

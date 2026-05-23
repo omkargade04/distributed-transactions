@@ -1,0 +1,8 @@
+/bin/
+/experiments/*/data/*.jsonl
+/experiments/*/data/*.sql
+/experiments/*/*.html
+/experiments/*/index.html
+.env
+*.log
+.DS_Store
