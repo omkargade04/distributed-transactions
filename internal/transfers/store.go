@@ -59,8 +59,12 @@ type Record struct {
 //   - txn_id is nullable until completed — Scan into *uuid.UUID.
 //   - completed_at + error_message are nullable strings/times — use *time.Time and *string.
 func LookupOrReserve(ctx context.Context, dbx *sql.DB, key string, incomingHash []byte) (*Record, error) {
-	// TODO: implement
 	var r Record
+	// response_status and response_payload are NULL for pending rows.
+	// database/sql can scan NULL into []byte (sets to nil) but not into named
+	// types like json.RawMessage or *int directly — use intermediary vars.
+	var respStatus sql.NullInt32
+	var respPayload []byte
 	err := dbx.QueryRowContext(ctx, `
 		SELECT id, idempotency_key, request_hash, request_payload,
 		       response_status, response_payload, status,
@@ -71,14 +75,19 @@ func LookupOrReserve(ctx context.Context, dbx *sql.DB, key string, incomingHash 
 		&r.IdempotencyKey,
 		&r.RequestHash,
 		&r.RequestPayload,
-		&r.ResponseStatus,
-		&r.ResponsePayload,
+		&respStatus,
+		&respPayload,
 		&r.Status,
 		&r.TxnID,
 		&r.CreatedAt,
 		&r.CompletedAt,
 		&r.ErrorMessage,
 	)
+	if respStatus.Valid {
+		v := int(respStatus.Int32)
+		r.ResponseStatus = &v
+	}
+	r.ResponsePayload = json.RawMessage(respPayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrCacheMiss
 	}
