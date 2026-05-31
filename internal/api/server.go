@@ -45,7 +45,7 @@ func NewServer(port int, dbx *sql.DB) *http.Server {
 	// TODO (you): add Idempotency middleware to the chain.
 	//   handler = h.IdempotencyMiddleware(handler)
 	var handler http.Handler = mux
-	// handler = h.IdempotencyMiddleware(handler)   // v2 — uncomment when implemented
+	handler = h.IdempotencyMiddleware(handler)
 	handler = LoggingMiddleware(handler)
 	handler = RequestIDMiddleware(handler)
 

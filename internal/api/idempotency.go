@@ -104,15 +104,70 @@ func IdempotencyFromContext(ctx context.Context) (key string, hash []byte, ok bo
 func (h *Handler) IdempotencyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// TODO: implement
-		_ = io.ReadAll
-		_ = bytes.NewReader
-		_ = uuid.NewString
-		_ = json.Unmarshal
-		_ = transfers.LookupOrReserve
-		_ = transfers.ErrCacheMiss
-		_ = errors.Is
-		_ = slog.InfoContext
-		next.ServeHTTP(w, r)
+		// 1. Only act on POST /v1/transfer. For other routes, pass through unchanged.
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/transfer" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, 400, errorResponse{Error: "body_read_failed"})
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		key := r.Header.Get("Idempotency-Key")
+		if key == "" {
+			key = uuid.NewString()
+		}
+
+		var generic any
+		if err := json.Unmarshal(body, &generic); err != nil {
+			writeJSON(w, 400, errorResponse{Error: "invalid_json"})
+			return
+		}
+
+		hash, err := transfers.HashCanonical(generic)
+		if err != nil {
+			writeJSON(w, 500, errorResponse{Error: "internal"})
+			return
+		}
+
+		rec, err := transfers.LookupOrReserve(r.Context(), h.DB, key, hash)
+		switch {
+		case err == nil:
+			slog.InfoContext(r.Context(), "transfer.replayed", "idempotency_key", key)
+			w.Header().Set("Idempotency-Replay", "true")
+			writeJSONRaw(w, *rec.ResponseStatus, rec.ResponsePayload)
+			return
+		case errors.Is(err, transfers.ErrInFlight):
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, 409, errorResponse{Error: "request_in_progress"})
+			return
+		case errors.Is(err, transfers.ErrPayloadConflict):
+			slog.WarnContext(r.Context(), "idempotency.conflict", "idempotency_key", key)
+			writeJSON(w, 422, errorResponse{Error: "idempotency_key_conflict"})
+			return
+		case errors.Is(err, transfers.ErrCacheMiss):
+			// INSERT pending row, then fall through to next handler
+			if err := transfers.Insert(r.Context(), h.DB, key, hash, body); err != nil {
+				if errors.Is(err, transfers.ErrInFlight) {
+					// race between LookupOrReserve and Insert
+					w.Header().Set("Retry-After", "1")
+					writeJSON(w, 409, errorResponse{Error: "request_in_progress"})
+					return
+				}
+				writeJSON(w, 500, errorResponse{Error: "internal"})
+				return
+			}
+		default:
+			slog.ErrorContext(r.Context(), "idempotency.lookup_failed", "error", err.Error())
+			writeJSON(w, 500, errorResponse{Error: "internal"})
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), idempotencyCtxKey{}, idempotencyData{Key: key, Hash: hash})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

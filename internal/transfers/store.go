@@ -1,13 +1,16 @@
 package transfers
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Record is one row of the transfers table.
@@ -56,8 +59,49 @@ type Record struct {
 //   - completed_at + error_message are nullable strings/times — use *time.Time and *string.
 func LookupOrReserve(ctx context.Context, dbx *sql.DB, key string, incomingHash []byte) (*Record, error) {
 	// TODO: implement
-	_ = sql.ErrNoRows
-	return nil, fmt.Errorf("LookupOrReserve not implemented")
+	var r Record
+	err := dbx.QueryRowContext(ctx, `
+		SELECT id, idempotency_key, request_hash, request_payload,
+		       response_status, response_payload, status,
+		       txn_id, created_at, completed_at, error_message
+		FROM transfers WHERE idempotency_key = $1
+	`, key).Scan(
+		&r.ID,
+		&r.IdempotencyKey,
+		&r.RequestHash,
+		&r.RequestPayload,
+		&r.ResponseStatus,
+		&r.ResponsePayload,
+		&r.Status,
+		&r.TxnID,
+		&r.CreatedAt,
+		&r.CompletedAt,
+		&r.ErrorMessage,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrCacheMiss
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup transfer: %w", err)
+	}
+	if !bytes.Equal(r.RequestHash, incomingHash) {
+		return nil, ErrPayloadConflict
+	}
+	switch r.Status {
+	case "completed":
+		return &r, nil
+	case "pending":
+		return nil, ErrInFlight
+	case "failed":
+		// Clear failed rows so they can be retried fresh
+		_, err = dbx.ExecContext(ctx, "DELETE FROM transfers WHERE idempotency_key = $1", key)
+		if err != nil {
+			return nil, fmt.Errorf("delete failed idempotency key: %w", err)
+		}
+		return nil, ErrCacheMiss
+	default:
+		return nil, fmt.Errorf("unknown transfer status: %s", r.Status)
+	}
 }
 
 // Insert reserves the idempotency_key with status='pending'.
@@ -77,7 +121,18 @@ func LookupOrReserve(ctx context.Context, dbx *sql.DB, key string, incomingHash 
 //   - Use ExecContext (we don't need the inserted row back).
 func Insert(ctx context.Context, dbx *sql.DB, key string, hash []byte, payload json.RawMessage) error {
 	// TODO: implement
-	return fmt.Errorf("Insert not implemented")
+	query := `
+		INSERT INTO transfers (idempotency_key, request_hash, request_payload, status)
+		VALUES ($1, $2, $3, 'pending')
+	`
+	_, err := dbx.ExecContext(ctx, query, key, hash, payload)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrInFlight
+		}
+		return fmt.Errorf("insert idempotency record: %w", err)
+	}
+	return nil
 }
 
 // MarkCompleted updates the row with the response and links to the ledger txn.
@@ -96,7 +151,20 @@ func Insert(ctx context.Context, dbx *sql.DB, key string, hash []byte, payload j
 // already-completed row (defensive — shouldn't happen in normal flow).
 func MarkCompleted(ctx context.Context, dbx *sql.DB, key string, txnID uuid.UUID, status int, body json.RawMessage) error {
 	// TODO: implement
-	return fmt.Errorf("MarkCompleted not implemented")
+	query := `
+		UPDATE transfers
+		SET status = 'completed',
+			response_status = $1,
+			response_payload = $2,
+			txn_id = $3,
+			completed_at = now()
+		WHERE idempotency_key = $4 AND status = 'pending'
+	`
+	_, err := dbx.ExecContext(ctx, query, status, body, txnID, key)
+	if err != nil {
+		return fmt.Errorf("mark transfer completed: %w", err)
+	}
+	return nil
 }
 
 // MarkFailed records that the underlying operation failed.
@@ -112,7 +180,18 @@ func MarkCompleted(ctx context.Context, dbx *sql.DB, key string, txnID uuid.UUID
 // Failed rows are not removed here — LookupOrReserve deletes them on retry.
 func MarkFailed(ctx context.Context, dbx *sql.DB, key string, errMsg string) error {
 	// TODO: implement
-	return fmt.Errorf("MarkFailed not implemented")
+	query := `
+		UPDATE transfers
+		SET status = 'failed',
+			error_message = $1,
+			completed_at = now()
+		WHERE idempotency_key = $2 AND status = 'pending'
+	`
+	_, err := dbx.ExecContext(ctx, query, errMsg, key)
+	if err != nil {
+		return fmt.Errorf("mark transfer failed: %w", err)
+	}
+	return nil
 }
 
 // isUniqueViolation returns true if err is a Postgres SQLSTATE 23505.
@@ -125,5 +204,6 @@ func MarkFailed(ctx context.Context, dbx *sql.DB, key string, errMsg string) err
 // Stub returns false — you wire it up.
 func isUniqueViolation(err error) bool {
 	// TODO: implement
-	return false
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

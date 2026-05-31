@@ -4,6 +4,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -46,14 +47,26 @@ func Migrate(dbURL string) error {
 	// Step 1: source from embedded FS
 	//   src, err := iofs.New(migrationsFS, "migrations")
 	//   if err != nil { return fmt.Errorf("migrate.iofs: %w", err) }
+	src, err := iofs.New(migrationsFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("migrate.iofs: %w", err)
+	}
+	defer src.Close()
+	
 	//
 	// Step 2: rewrite URL scheme for migrate driver
 	//   migURL := strings.Replace(dbURL, "postgres://", "pgx5://", 1)
+	migURL := strings.Replace(dbURL, "postgres://", "pgx5://", 1)
 	//
 	// Step 3: build migrator
 	//   m, err := migrate.NewWithSourceInstance("iofs", src, migURL)
 	//   if err != nil { return fmt.Errorf("migrate.new: %w", err) }
 	//   defer m.Close()
+	m, err := migrate.NewWithSourceInstance("iofs", src, migURL)
+	if err != nil {
+		return fmt.Errorf("migrate.new: %w", err)
+	}
+	defer m.Close()
 	//
 	// Step 4: apply
 	//   err = m.Up()
@@ -61,9 +74,9 @@ func Migrate(dbURL string) error {
 	//       return fmt.Errorf("migrate.up: %w", err)
 	//   }
 	//   return nil
-	_ = embed.FS{}
-	_ = iofs.New
-	_ = migrate.ErrNoChange
-	_ = errors.Is
-	return fmt.Errorf("Migrate not implemented")
+	err = m.Up()
+	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("migrate.up: %w", err)
+	}
+	return nil
 }
