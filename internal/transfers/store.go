@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -203,7 +204,11 @@ func MarkFailed(ctx context.Context, dbx *sql.DB, key string, errMsg string) err
 //
 // Stub returns false — you wire it up.
 func isUniqueViolation(err error) bool {
-	// TODO: implement
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	// Fallback: pgx/v5 stdlib adapter may not preserve *pgconn.PgError
+	// in the error chain when accessed via database/sql interface.
+	return strings.Contains(err.Error(), "23505")
 }
