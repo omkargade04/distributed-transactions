@@ -63,8 +63,10 @@ func Transfer(ctx context.Context, dbx *sql.DB, req TransferRequest) (*TransferR
 	defer tx.Rollback() // safe even after Commit — Postgres ignores it.
 
 	// D. Read payer balance INSIDE the transaction (tx, not dbx).
+	// v3: QGetAccountForUpdate acquires a row lock so concurrent transfers from
+	// the same payer serialize here rather than racing past the balance check.
 	var payerBal int64
-	err = tx.QueryRowContext(ctx, db.QGetAccount, req.PayerID).
+	err = tx.QueryRowContext(ctx, db.QGetAccountForUpdate, req.PayerID).
 		Scan(new(string), &payerBal, new(string))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrAccountNotFound

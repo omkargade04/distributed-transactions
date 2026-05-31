@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	// Side-effect import: registers the pgx driver with database/sql.
 	// We can then call sql.Open("pgx", ...) without referring to the pgx package directly.
@@ -35,5 +36,13 @@ func Open(dbURL string) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("db.Ping: %w", err)
 	}
+	// v3: pool limits prevent Postgres max_connections exhaustion (v1 exp 04).
+	// MaxOpenConns=20  caps total connections from this app.
+	// MaxIdleConns=10  keeps 10 warm between bursts (avoids reconnect overhead).
+	// ConnMaxLifetime  recycles stale connections — fixes exp 05 stale-pool
+	//                  issue when Postgres restarts and pool holds dead conns.
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
 	return db, nil
 }
