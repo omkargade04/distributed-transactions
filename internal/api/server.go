@@ -29,5 +29,15 @@ import (
 //   - If you swap them, log lines lack request_id.
 func NewServer(port int, dbx *sql.DB) *http.Server {
 	// TODO: implement
-	return &http.Server{Addr: fmt.Sprintf(":%d", port)}
+	h := &Handler{DB: dbx}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", h.Health)
+	mux.HandleFunc("POST /v1/transfer", h.Transfer)
+	mux.HandleFunc("GET /v1/accounts/{id}", h.GetAccount)
+
+	var handler http.Handler = mux
+	handler = LoggingMiddleware(handler)
+	handler = RequestIDMiddleware(handler)
+
+	return &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: handler}
 }

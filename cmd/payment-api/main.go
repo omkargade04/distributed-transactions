@@ -30,9 +30,22 @@ import (
 // We do NOT panic — panics produce ugly stacks, exit is clean.
 func main() {
 	// TODO: implement
-	_ = slog.Default
-	_ = os.Exit
-	_ = api.NewServer
-	_ = config.Load
-	_ = db.Open
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("config.load_failed", "error", err.Error())
+		os.Exit(1)
+	}
+	dbx, err := db.Open(cfg.DBURL)
+	if err != nil {
+		slog.Error("db.open_failed", "error", err.Error())
+		os.Exit(1)
+	}
+	defer dbx.Close()
+	srv := api.NewServer(cfg.Port, dbx)
+	slog.Info("server.start", "svc", "payment-api", "port", cfg.Port)
+	if err := srv.ListenAndServe(); err != nil {
+		slog.Error("server.shutdown", "error", err.Error())
+		os.Exit(1)
+	}
 }

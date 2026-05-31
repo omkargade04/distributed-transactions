@@ -3,6 +3,8 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/omkargade/distributed-payment-system/internal/ledger"
@@ -35,7 +37,7 @@ type errorResponse struct {
 //   - Body: {"status":"ok"}
 // Hint: use writeJSON helper below.
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-	// TODO: implement
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // Transfer handles POST /v1/transfer.
@@ -53,7 +55,30 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 //   - json.NewDecoder(r.Body).Decode(&req) is idiomatic.
 //   - Use writeJSON helper (below).
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
-	// TODO: implement
+	var req transferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_json"})
+		return
+	}
+
+	slog.InfoContext(r.Context(), "transfer.received",
+		"request_id", RequestIDFromContext(r.Context()),
+		"payer_id", req.PayerID,
+		"payee_id", req.PayeeID,
+		"amount_minor", req.AmountMinor,
+	)
+
+	result, err := ledger.Transfer(r.Context(), h.DB, ledger.TransferRequest{
+		PayerID:     req.PayerID,
+		PayeeID:     req.PayeeID,
+		AmountMinor: req.AmountMinor,
+		Currency:    req.Currency,
+	})
+	if err != nil {
+		h.handleTransferError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 // handleTransferError maps domain errors → HTTP status codes + JSON response.
@@ -69,9 +94,21 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 //
 // Why a separate function? Keeps Transfer handler tidy. Many error types, one mapping.
 func (h *Handler) handleTransferError(w http.ResponseWriter, r *http.Request, err error) {
-	// TODO: implement
-	_ = ledger.ErrAccountNotFound // remove this line once you use the ledger package
-	writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "not_implemented"})
+	switch {
+	case errors.Is(err, ledger.ErrAccountNotFound):
+		slog.InfoContext(r.Context(), "transfer.rejected", "reason", "account_not_found")
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "account_not_found"})
+	case errors.Is(err, ledger.ErrInsufficientFunds):
+		slog.InfoContext(r.Context(), "transfer.rejected", "reason", "insufficient_funds")
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "insufficient_funds"})
+	case errors.Is(err, ledger.ErrSamePayerPayee):
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "same_payer_payee"})
+	case errors.Is(err, ledger.ErrInvalidAmount):
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_amount"})
+	default:
+		slog.ErrorContext(r.Context(), "transfer.failed", "error", err.Error())
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal"})
+	}
 }
 
 // GetAccount handles GET /v1/accounts/{id}.
@@ -88,7 +125,18 @@ func (h *Handler) handleTransferError(w http.ResponseWriter, r *http.Request, er
 // Note: r.PathValue("id") is a Go 1.22+ feature. Works with the new net/http patterns
 // like "GET /v1/accounts/{id}" which we register in server.go.
 func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {
-	// TODO: implement
+	id := r.PathValue("id")
+	account, err := ledger.GetAccount(r.Context(), h.DB, id)
+	if errors.Is(err, ledger.ErrAccountNotFound) {
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "account_not_found"})
+		return
+	}
+	if err != nil {
+		slog.ErrorContext(r.Context(), "account.lookup_failed", "error", err.Error())
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, account)
 }
 
 // writeJSON writes a JSON response with the given status code.

@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -107,22 +111,167 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 
-	// TODO: implement everything below this line
-	_ = *target
-	_ = *rps
-	_ = *workers
-	_ = *duration
-	_ = *seed
-	_ = *accounts
-	_ = *output
-	_ = rand.New
-	_ = http.Client{}
-	_ = json.Marshal
-	_ = context.Background
-	_ = sync.WaitGroup{}
+	accountIDs := make([]string, *accounts)
+	for i := range accountIDs {
+		accountIDs[i] = fmt.Sprintf("acc_%03d", i+1)
+	}
 
-	fmt.Println("simulator not implemented")
-	os.Exit(2)
+	var file *os.File
+	if *output != "" {
+		var err error
+		file, err = os.Create(*output)
+		if err != nil {
+			slog.Error("failed to create output file", "error", err)
+			os.Exit(2)
+		}
+		defer file.Close()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *duration)
+	defer cancel()
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Ticker for pacing: time.NewTicker(time.Second / time.Duration(rps))
+	ticker := time.NewTicker(time.Second / time.Duration(*rps))
+	defer ticker.Stop()
+
+	// Records channel: chan record, buffered 1024. Start writer goroutine reading from it.
+	records := make(chan record, 1024)
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
+	go func() {
+		defer writerWg.Done()
+		for r := range records {
+			if file != nil {
+				b, _ := json.Marshal(r)
+				_, _ = file.Write(b)
+				_, _ = file.Write([]byte("\n"))
+			}
+		}
+	}()
+
+	jobs := make(chan struct{}, *workers*2)
+
+	var (
+		sent         int64
+		completed2xx int64
+		rejected4xx  int64
+		failed5xx    int64
+		latenciesMu  sync.Mutex
+		latencies    []int64
+	)
+
+	var wg sync.WaitGroup
+	for w := 0; w < *workers; w++ {
+		wg.Add(1)
+		go func(workerIndex int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(*seed + int64(workerIndex)))
+			for range jobs {
+				p1 := accountIDs[rng.Intn(len(accountIDs))]
+				p2 := accountIDs[rng.Intn(len(accountIDs))]
+				for p1 == p2 {
+					p2 = accountIDs[rng.Intn(len(accountIDs))]
+				}
+				amount := int64(rng.Intn(5000) + 1)
+
+				body, _ := json.Marshal(transferReq{
+					PayerID:     p1,
+					PayeeID:     p2,
+					AmountMinor: amount,
+					Currency:    "USD",
+				})
+
+				reqStart := time.Now()
+				resp, err := httpClient.Post(*target+"/v1/transfer", "application/json", bytes.NewReader(body))
+				latency := time.Since(reqStart).Milliseconds()
+
+				rec := record{
+					TS:        time.Now().UTC().Format(time.RFC3339Nano),
+					Payer:     p1,
+					Payee:     p2,
+					Amount:    amount,
+					LatencyMs: latency,
+				}
+
+				if err != nil {
+					rec.Status = 0
+					rec.Error = err.Error()
+					atomic.AddInt64(&failed5xx, 1)
+				} else {
+					rec.Status = resp.StatusCode
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+
+					switch {
+					case resp.StatusCode >= 200 && resp.StatusCode < 300:
+						atomic.AddInt64(&completed2xx, 1)
+					case resp.StatusCode >= 400 && resp.StatusCode < 500:
+						atomic.AddInt64(&rejected4xx, 1)
+					default:
+						atomic.AddInt64(&failed5xx, 1)
+					}
+				}
+
+				select {
+				case records <- rec:
+				case <-ctx.Done():
+				}
+
+				atomic.AddInt64(&sent, 1)
+
+				latenciesMu.Lock()
+				latencies = append(latencies, latency)
+				latenciesMu.Unlock()
+			}
+		}(w)
+	}
+
+	runStart := time.Now()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				close(jobs)
+				return
+			case <-ticker.C:
+				select {
+				case jobs <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(records)
+	writerWg.Wait()
+
+	totalDuration := time.Since(runStart)
+
+	latenciesMu.Lock()
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p50 := percentile(latencies, 50)
+	p95 := percentile(latencies, 95)
+	p99 := percentile(latencies, 99)
+	latenciesMu.Unlock()
+
+	summary := map[string]any{
+		"event":         "simulator.summary",
+		"sent":          atomic.LoadInt64(&sent),
+		"completed_2xx": atomic.LoadInt64(&completed2xx),
+		"rejected_4xx":  atomic.LoadInt64(&rejected4xx),
+		"failed_5xx":    atomic.LoadInt64(&failed5xx),
+		"p50_ms":        p50,
+		"p95_ms":        p95,
+		"p99_ms":        p99,
+		"duration_s":    totalDuration.Seconds(),
+		"actual_rps":    float64(sent) / totalDuration.Seconds(),
+		"seed":          *seed,
+	}
+	b, _ := json.MarshalIndent(summary, "", "  ")
+	fmt.Println(string(b))
 }
 
 // percentile returns the value at the given percentile in a sorted slice.

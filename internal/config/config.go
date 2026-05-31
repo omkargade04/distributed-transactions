@@ -19,33 +19,37 @@ type Config struct {
 }
 
 // Load reads env vars and returns Config or an error if anything is missing/invalid.
-//
-// TODO (you): implement this function.
-//
-// Requirements:
-//   1. Read DB_URL — if empty, return error "DB_URL required"
-//   2. Read PORT — default "8080" if unset. Convert to int. If non-numeric, return error.
-//   3. Read LOG_LEVEL — default "info" if unset.
-//
-// Hint — Go idioms you'll use:
-//   - os.Getenv("DB_URL") returns "" if unset
-//   - strconv.Atoi(s) → (int, error)
-//   - fmt.Errorf("xxx: %w", err) wraps an error preserving the chain
-//
-// Test by running: PORT=abc go run ./cmd/payment-api  → should error on startup.
 func Load() (*Config, error) {
-	// TODO: implement
-	return nil, fmt.Errorf("Load not implemented")
+	// 1. DB_URL is required. os.Getenv returns "" when unset — no fallback needed.
+	dbURL := os.Getenv("DB_URL")
+	if dbURL == "" {
+		return nil, fmt.Errorf("DB_URL required")
+	}
+
+	// 2. PORT — default "8080" if unset, then parse.
+	//    Use the helper getEnvDefault so we don't pass "" into Atoi.
+	portStr := getEnvDefault("PORT", "8080")
+	// strconv.Atoi returns TWO values: (int, error). Capture both.
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		// Wrap with %w so callers can errors.Is / errors.Unwrap the underlying strconv.NumError.
+		return nil, fmt.Errorf("invalid PORT %q: %w", portStr, err)
+	}
+
+	// 3. LOG_LEVEL — default "info".
+	logLevel := getEnvDefault("LOG_LEVEL", "info")
+
+	return &Config{
+		DBURL:    dbURL,
+		Port:     port,
+		LogLevel: logLevel,
+	}, nil
 }
 
 // getEnvDefault returns os.Getenv(key) or def if empty.
-// Helper — already written so you can focus on Load().
 func getEnvDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
-
-// Suppress unused-import lint until you wire strconv up.
-var _ = strconv.Atoi

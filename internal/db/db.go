@@ -28,6 +28,12 @@ import (
 //   - *sql.DB is safe for concurrent use. Don't open one per request.
 //   - The caller (main) is responsible for db.Close() on shutdown.
 func Open(dbURL string) (*sql.DB, error) {
-	// TODO: implement
-	return nil, fmt.Errorf("Open not implemented")
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("sql.Open: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("db.Ping: %w", err)
+	}
+	return db, nil
 }

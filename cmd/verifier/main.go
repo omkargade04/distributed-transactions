@@ -87,13 +87,111 @@ func main() {
 		os.Exit(2)
 	}
 
-	// TODO: implement everything below this line
-	_ = sql.Open
-	_ = json.MarshalIndent
-	_ = *initialBalance
+	dbx, err := sql.Open("pgx", *dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
+		os.Exit(2)
+	}
+	defer dbx.Close()
 
-	fmt.Println("verifier not implemented")
-	os.Exit(2)
+	res := Result{
+		DriftedAccounts:      []string{},
+		NegativeBalanceAccts: []string{},
+		OrphanTxnIDs:         []string{},
+		Pass:                 true,
+	}
+
+	// I1 — ledger sum
+	err = dbx.QueryRow("SELECT COALESCE(SUM(amount_minor), 0) FROM ledger_entries").Scan(&res.LedgerSum)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "query I1 failed: %v\n", err)
+		os.Exit(2)
+	}
+	if res.LedgerSum != 0 {
+		res.Pass = false
+	}
+
+	// I2 — balance drift
+	rowsI2, err := dbx.Query(`
+		SELECT a.id
+		FROM accounts a
+		LEFT JOIN ledger_entries l ON l.account_id = a.id
+		GROUP BY a.id, a.balance_minor
+		HAVING a.balance_minor != COALESCE(SUM(l.amount_minor), 0) + $1
+	`, *initialBalance)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "query I2 failed: %v\n", err)
+		os.Exit(2)
+	}
+	defer rowsI2.Close()
+	for rowsI2.Next() {
+		var id string
+		if err := rowsI2.Scan(&id); err != nil {
+			fmt.Fprintf(os.Stderr, "scan I2 failed: %v\n", err)
+			os.Exit(2)
+		}
+		res.DriftedAccounts = append(res.DriftedAccounts, id)
+	}
+	if len(res.DriftedAccounts) > 0 {
+		res.Pass = false
+	}
+
+	// Negative balances
+	rowsNeg, err := dbx.Query("SELECT id FROM accounts WHERE balance_minor < 0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "query negative balances failed: %v\n", err)
+		os.Exit(2)
+	}
+	defer rowsNeg.Close()
+	for rowsNeg.Next() {
+		var id string
+		if err := rowsNeg.Scan(&id); err != nil {
+			fmt.Fprintf(os.Stderr, "scan negative balances failed: %v\n", err)
+			os.Exit(2)
+		}
+		res.NegativeBalanceAccts = append(res.NegativeBalanceAccts, id)
+	}
+	if len(res.NegativeBalanceAccts) > 0 {
+		res.Pass = false
+	}
+
+	// I3 — orphan txn_ids
+	rowsI3, err := dbx.Query("SELECT txn_id::text FROM ledger_entries GROUP BY txn_id HAVING COUNT(*) != 2")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "query I3 failed: %v\n", err)
+		os.Exit(2)
+	}
+	defer rowsI3.Close()
+	for rowsI3.Next() {
+		var txnID string
+		if err := rowsI3.Scan(&txnID); err != nil {
+			fmt.Fprintf(os.Stderr, "scan I3 failed: %v\n", err)
+			os.Exit(2)
+		}
+		res.OrphanTxnIDs = append(res.OrphanTxnIDs, txnID)
+	}
+	if len(res.OrphanTxnIDs) > 0 {
+		res.Pass = false
+	}
+
+	fmt.Println("=== Verifier Report ===")
+	printCheck("I1 ledger sum == 0          ", res.LedgerSum == 0, fmt.Sprintf("sum=%d", res.LedgerSum))
+	printCheck("I2 no balance drift         ", len(res.DriftedAccounts) == 0, fmt.Sprintf("drifted=%v", res.DriftedAccounts))
+	printCheck("    no negative balances    ", len(res.NegativeBalanceAccts) == 0, fmt.Sprintf("negative=%v", res.NegativeBalanceAccts))
+	printCheck("I3 all txns have 2 entries  ", len(res.OrphanTxnIDs) == 0, fmt.Sprintf("orphans=%v", res.OrphanTxnIDs))
+
+	fmt.Println("\n--- JSON ---")
+	jsonBytes, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "json marshal failed: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Println(string(jsonBytes))
+
+	if !res.Pass {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // printCheck — pretty status line.
