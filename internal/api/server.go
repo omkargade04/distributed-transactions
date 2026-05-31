@@ -35,7 +35,17 @@ func NewServer(port int, dbx *sql.DB) *http.Server {
 	mux.HandleFunc("POST /v1/transfer", h.Transfer)
 	mux.HandleFunc("GET /v1/accounts/{id}", h.GetAccount)
 
+	// Middleware chain (outermost → innermost at request time):
+	//   RequestID → Logging → Idempotency → mux
+	//
+	// IdempotencyMiddleware is INNERMOST (closest to mux) so:
+	//   - Logging sees every request (including cache hits that skip handler)
+	//   - Idempotency runs AFTER request_id is in context (for log correlation)
+	//
+	// TODO (you): add Idempotency middleware to the chain.
+	//   handler = h.IdempotencyMiddleware(handler)
 	var handler http.Handler = mux
+	// handler = h.IdempotencyMiddleware(handler)   // v2 — uncomment when implemented
 	handler = LoggingMiddleware(handler)
 	handler = RequestIDMiddleware(handler)
 

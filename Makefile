@@ -5,6 +5,8 @@ RPS ?= 50
 WORKERS ?= 10
 DURATION ?= 30s
 EXPERIMENT_ID ?= 00
+RETRIES ?= 3
+VERSION ?= v2
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -24,12 +26,13 @@ down:  ## Stop stack (keep data)
 logs:  ## Tail payment-api logs through jq
 	docker logs -f payment-api | jq .
 
-sim: build  ## Run simulator (override RPS, WORKERS, DURATION, EXPERIMENT_ID)
-	mkdir -p experiments/v1/data
+sim: build  ## Run simulator (override RPS, WORKERS, DURATION, EXPERIMENT_ID, RETRIES, VERSION)
+	mkdir -p experiments/$(VERSION)/data
 	./bin/simulator \
 	  --target=http://localhost:8080 \
+	  --retries=$(RETRIES) \
 	  --rps=$(RPS) --workers=$(WORKERS) --duration=$(DURATION) \
-	  --output=experiments/v1/data/$(EXPERIMENT_ID)-sim-requests.jsonl
+	  --output=experiments/$(VERSION)/data/$(EXPERIMENT_ID)-sim-requests.jsonl
 
 verify: build  ## Run verifier against current DB state
 	./bin/verifier --db="$(DB_URL)"

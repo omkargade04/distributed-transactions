@@ -54,6 +54,35 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 // Hint:
 //   - json.NewDecoder(r.Body).Decode(&req) is idiomatic.
 //   - Use writeJSON helper (below).
+// Transfer handles POST /v1/transfer.
+//
+// v2 changes: after ledger.Transfer success/failure, persist the response
+// to the transfers table via transfers.MarkCompleted / MarkFailed so future
+// requests with the same Idempotency-Key get a cached replay.
+//
+// TODO (you): add the MarkCompleted / MarkFailed calls.
+//
+// Hint for v2 wiring:
+//   key, _, hasKey := IdempotencyFromContext(r.Context())
+//
+// On error path (after handleTransferError, BEFORE return):
+//   if hasKey {
+//       _ = transfers.MarkFailed(r.Context(), h.DB, key, err.Error())
+//   }
+//
+// On success path (after json.Marshal(result), BEFORE writeJSON):
+//   if hasKey {
+//       txnUUID, _ := uuid.Parse(result.TxnID)
+//       body, _ := json.Marshal(result)
+//       if err := transfers.MarkCompleted(r.Context(), h.DB, key, txnUUID, http.StatusOK, body); err != nil {
+//           slog.ErrorContext(r.Context(), "transfers.mark_completed_failed", "error", err.Error())
+//       }
+//       writeJSONRaw(w, http.StatusOK, body)   // use Raw to write the exact body we just hashed
+//       return
+//   }
+//   writeJSON(w, http.StatusOK, result)
+//
+// Add to log line: "idempotency_key", key
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 	var req transferRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -61,8 +90,11 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key, _, _ := IdempotencyFromContext(r.Context()) // _ = hasKey, wire when ready
+
 	slog.InfoContext(r.Context(), "transfer.received",
 		"request_id", RequestIDFromContext(r.Context()),
+		"idempotency_key", key,
 		"payer_id", req.PayerID,
 		"payee_id", req.PayeeID,
 		"amount_minor", req.AmountMinor,
@@ -75,9 +107,12 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		Currency:    req.Currency,
 	})
 	if err != nil {
+		// TODO v2: if hasKey { transfers.MarkFailed(..., key, err.Error()) }
 		h.handleTransferError(w, r, err)
 		return
 	}
+
+	// TODO v2: persist result for replay via transfers.MarkCompleted
 	writeJSON(w, http.StatusOK, result)
 }
 

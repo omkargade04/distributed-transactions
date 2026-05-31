@@ -26,14 +26,42 @@ type transferReq struct {
 }
 
 // record is one row of the JSONL output file. Used by HTML reports for chart data.
+// record is one row of the JSONL output — emitted PER ATTEMPT (not per intent).
+//
+// v2 additions: IdempotencyKey, Attempt, Retried, Final
 type record struct {
-	TS        string `json:"ts"`
-	Payer     string `json:"payer"`
-	Payee     string `json:"payee"`
-	Amount    int64  `json:"amount"`
-	Status    int    `json:"status"`     // HTTP status, or 0 if request errored before reply
-	LatencyMs int64  `json:"latency_ms"`
-	Error     string `json:"error,omitempty"`
+	TS             string `json:"ts"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"` // v2: same across retries of one intent
+	Attempt        int    `json:"attempt,omitempty"`         // v2: 1, 2, 3...
+	Payer          string `json:"payer"`
+	Payee          string `json:"payee"`
+	Amount         int64  `json:"amount"`
+	Status         int    `json:"status"`     // HTTP status, or 0 if request errored before reply
+	LatencyMs      int64  `json:"latency_ms"`
+	Retried        bool   `json:"retried,omitempty"` // v2: true if a retry was attempted after this record
+	Final          bool   `json:"final,omitempty"`   // v2: true if this is the terminal attempt for this intent
+	Replayed       bool   `json:"replayed,omitempty"` // v2: true if server returned Idempotency-Replay: true
+	Error          string `json:"error,omitempty"`
+}
+
+// isRetryable returns true if this status/error should trigger another attempt.
+//
+// TODO (you): implement.
+//
+// Retry on:
+//   - err != nil           (connection error, timeout)
+//   - status == 0          (no response received)
+//   - status >= 500        (server error — could be transient)
+//   - status == 408        (request timeout)
+//   - status == 429        (rate limited — should also honor Retry-After header)
+//
+// Do NOT retry on:
+//   - any other 4xx — esp. 400, 404, 422 (idempotency conflict — caller bug)
+//
+// Returning false from this function = intent is terminal (success or hard failure).
+func isRetryable(status int, err error) bool {
+	// TODO: implement
+	return false
 }
 
 // Simulator emits concurrent transfers at a target RPS.
@@ -101,12 +129,19 @@ type record struct {
 //   - Forgetting to handle ctx cancellation in workers → goroutines outlive program.
 func main() {
 	target := flag.String("target", "http://localhost:8080", "payment-api URL")
-	rps := flag.Int("rps", 100, "target requests per second")
+	rps := flag.Int("rps", 100, "target requests per second (intents/sec)")
 	workers := flag.Int("workers", 10, "concurrent worker count")
 	duration := flag.Duration("duration", 60*time.Second, "run duration")
 	seed := flag.Int64("seed", time.Now().UnixNano(), "random seed (for reproducible runs)")
 	accounts := flag.Int("accounts", 100, "size of pre-seeded account pool")
 	output := flag.String("output", "", "JSONL output path (optional)")
+	// v2 flags
+	retries := flag.Int("retries", 3, "max attempts per intent (1 initial + N-1 retries)")
+	backoffBaseMs := flag.Int("backoff-base-ms", 200, "base for exponential backoff in ms")
+	perAttemptTimeout := flag.Duration("per-attempt-timeout", 5*time.Second, "per-HTTP-attempt timeout")
+	_ = retries
+	_ = backoffBaseMs
+	_ = perAttemptTimeout
 	flag.Parse()
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -154,12 +189,21 @@ func main() {
 	jobs := make(chan struct{}, *workers*2)
 
 	var (
+		// v1 counters — still emitted for backward compat with v1 reporting
 		sent         int64
 		completed2xx int64
 		rejected4xx  int64
 		failed5xx    int64
 		latenciesMu  sync.Mutex
 		latencies    []int64
+
+		// v2 counters — track intents (unique idempotency keys) vs attempts (HTTP requests)
+		// TODO (you): wire these in the worker loop.
+		// intentsSent      int64  // one per outermost loop iteration
+		// intentsCompleted int64  // intent eventually got 2xx
+		// intentsFailed    int64  // intent exhausted retries OR got non-retryable 4xx
+		// requestsTotal    int64  // HTTP attempts including retries (≥ intentsSent)
+		// replaysServed    int64  // count of Idempotency-Replay: true responses
 	)
 
 	var wg sync.WaitGroup
@@ -168,6 +212,48 @@ func main() {
 		go func(workerIndex int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(*seed + int64(workerIndex)))
+			// v2: per worker = one intent per loop iteration. Each intent makes 1..N HTTP attempts.
+			//
+			// TODO (you): wrap the existing single-attempt HTTP code in a retry loop.
+			//
+			// for range jobs {
+			//     // (existing pick-payer/payee/amount + build body)
+			//     intentKey := uuid.NewString()                   // one key per intent (per Q4)
+			//
+			//     for attempt := 1; attempt <= *retries; attempt++ {
+			//         attemptCtx, cancel := context.WithTimeout(ctx, *perAttemptTimeout)
+			//         req, _ := http.NewRequestWithContext(attemptCtx, "POST", *target+"/v1/transfer", bytes.NewReader(body))
+			//         req.Header.Set("Content-Type", "application/json")
+			//         req.Header.Set("Idempotency-Key", intentKey)
+			//
+			//         resp, err := httpClient.Do(req)
+			//         latency := time.Since(reqStart).Milliseconds()
+			//         cancel()
+			//
+			//         // build record (set IdempotencyKey, Attempt, Status, LatencyMs, Replayed)
+			//         // emit record via records channel
+			//
+			//         // check if retry needed
+			//         needRetry := isRetryable(rec.Status, err) && attempt < *retries
+			//         rec.Retried = needRetry
+			//         rec.Final = !needRetry
+			//         records <- rec
+			//
+			//         if !needRetry {
+			//             // intent terminal
+			//             if rec.Status >= 200 && rec.Status < 300 { atomic.AddInt64(&intentsCompleted, 1) }
+			//             else                                       { atomic.AddInt64(&intentsFailed, 1)    }
+			//             break
+			//         }
+			//
+			//         // exponential backoff with full jitter
+			//         sleep := time.Duration(*backoffBaseMs) * time.Millisecond * (1 << (attempt - 1))
+			//         jitter := time.Duration(rng.Int63n(int64(sleep / 2)))
+			//         time.Sleep(sleep + jitter)
+			//     }
+			//
+			//     atomic.AddInt64(&intentsSent, 1)
+			// }
 			for range jobs {
 				p1 := accountIDs[rng.Intn(len(accountIDs))]
 				p2 := accountIDs[rng.Intn(len(accountIDs))]

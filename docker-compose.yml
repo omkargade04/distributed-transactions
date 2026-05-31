@@ -11,7 +11,8 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
+      # v2: migrations now run from the Go binary via golang-migrate.
+      # Previous mount removed:  - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U payment -d payment"]
       interval: 2s
@@ -33,7 +34,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: "no"   # DELIBERATE: crashes must stay crashed in v1
+    restart: "no"   # DELIBERATE: crashes must stay crashed (kill experiments)
+    stop_grace_period: 35s   # v2: > srv.Shutdown(30s) timeout, lets graceful drain finish
 
 volumes:
   pgdata:

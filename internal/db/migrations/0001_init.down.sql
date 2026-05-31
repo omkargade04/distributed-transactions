@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS ledger_entries;
+DROP TABLE IF EXISTS accounts;
+DROP EXTENSION IF EXISTS pgcrypto;
